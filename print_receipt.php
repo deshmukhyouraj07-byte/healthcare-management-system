@@ -8,45 +8,13 @@
  * Security: only accessible to a logged-in staff/doctor, and the data is
  * cleared from the session immediately after being read so it cannot be
  * reprinted later or by reloading the page after leaving.
+ *
+ * Note: the acknowledgement email is now sent directly from portal.php at the
+ * moment of registration, not from this page — so this file no longer needs
+ * to trigger it.
  */
 session_start();
 require_once __DIR__ . '/translations.php';
-require __DIR__ . '/vendor/autoload.php';
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
-
-function sendReceiptEmail(array $receipt): bool {
-    if (empty($receipt['email'])) return false;
-
-    $mail = new PHPMailer(true);
-    try {
-        $mail->isSMTP();
-        $mail->Host       = 'smtp.gmail.com';
-        $mail->SMTPAuth   = true;
-        $mail->Username   = 'youractualemail@gmail.com';
-        $mail->Password   = 'bjqoxkxloerojsww';
-        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
-        $mail->Port       = 587;
-
-        $mail->setFrom('youractualemail@gmail.com', 'Sassoon General Hospital');
-        $mail->addAddress($receipt['email'], $receipt['full_name']);
-
-        $mail->isHTML(true);
-        $mail->Subject = 'Your Patient Registration Details';
-        $mail->Body    = "
-            <p>Dear {$receipt['full_name']},</p>
-            <p>Your registration is complete. Here are your login details:</p>
-            <p><b>Patient ID:</b> {$receipt['patient_id']}<br>
-            <b>Password:</b> {$receipt['password']}</p>
-            <p>Please keep this information safe.</p>
-        ";
-
-        return $mail->send();
-    } catch (Exception $e) {
-        error_log('Mailer Error: ' . $mail->ErrorInfo);
-        return false;
-    }
-}
 
 if (!isset($_SESSION['lang'])) {
     header('Location: language_select.php');
@@ -57,10 +25,8 @@ if (!isset($_SESSION['staff_id'])) {
     header('Location: portal.php?role=employee');
     exit;
 }
+
 $receipt = $_SESSION['last_registered_receipt'] ?? null;
-if ($receipt) {
-    sendReceiptEmail($receipt);
-}
 unset($_SESSION['last_registered_receipt']); // one-time use only
 
 $staffName = $_SESSION['staff_name'] ?? '';
