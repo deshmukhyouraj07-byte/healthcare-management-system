@@ -5,8 +5,8 @@
  */
 session_start();
 require_once __DIR__ . '/translations.php';
-
-const HOSPITAL_NAME = "Sassoon General Hospital, Pune"; // English fallback for pages without translations.php
+/*wenesdays stop*/
+const HOSPITAL_NAME = " Sassoon General Hospital, Pune"; // English fallback for pages without translations.php
 
 // First-time visitors (no language chosen yet) go to the language picker first.
 if (!isset($_SESSION['lang'])) {
@@ -32,6 +32,7 @@ $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Noto+Sans+Devanagari:wght@400;600;700&display=swap" rel="stylesheet">
 
 <style>
+  
   :root{
     /* ---- Customize your palette here ---- */
     --brand-primary:#0d6ea8;
