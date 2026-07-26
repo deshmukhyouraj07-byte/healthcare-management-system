@@ -9,6 +9,11 @@
 session_start();
 require_once __DIR__ . '/db_config.php';
 require_once __DIR__ . '/translations.php';
+require_once __DIR__ . '/session_helpers.php';
+
+// Auto-logout doctor/staff sessions after 2 minutes of inactivity. Must run
+// BEFORE the role-match check below, since it may clear $_SESSION['staff_id'].
+enforceStaffSessionTimeout(120);
 
 if (!isset($_SESSION['lang'])) {
     header('Location: language_select.php');
@@ -20,6 +25,13 @@ $allowedRoles = ['employee', 'staff', 'patient'];
 if (!in_array($role, $allowedRoles, true)) {
     $role = 'employee'; // sensible default instead of a hard error
 }
+
+// A staff/employee session only counts as "logged in" for THIS page if the
+// role actually matches what's stored in the session. This is what prevents
+// e.g. a nurse who is logged in via the Staff tab from seeing the Doctor
+// dashboard just by visiting portal.php?role=employee, and vice versa —
+// they'll correctly see a fresh login form for the role they're not in.
+$isStaffLoggedInForThisRole = isset($_SESSION['staff_id']) && ($_SESSION['staff_role'] ?? null) === $role;
 
 $errors  = [];
 $success = '';
@@ -43,11 +55,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $user = $stmt->fetch();
 
             if ($user && password_verify($password, $user['password_hash'])) {
-                $_SESSION['staff_id']       = $user['id'];
-                $_SESSION['staff_username'] = $user['username'];
-                $_SESSION['staff_name']     = $user['full_name'];
-                $_SESSION['staff_role']     = $user['role'];
-                $_SESSION['can_provision']  = (bool) $user['can_provision_credentials'];
+                if ($user['role'] !== $role) {
+                    // Correct credentials, but wrong tab — e.g. a nurse/staff
+                    // account trying to log in through the Doctor tab, or
+                    // vice versa. Reject instead of silently logging them in.
+                    $errors[] = t('err_login_wrong_role');
+                } else {
+                    $_SESSION['staff_id']       = $user['id'];
+                    $_SESSION['staff_username'] = $user['username'];
+                    $_SESSION['staff_name']     = $user['full_name'];
+                    $_SESSION['staff_role']     = $user['role'];
+                    $_SESSION['can_provision']  = (bool) $user['can_provision_credentials'];
+                    $_SESSION['staff_last_activity'] = time();
+                }
             } else {
                 $errors[] = t('err_login_invalid');
             }
@@ -219,6 +239,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
+// ---- Update Doctor Qualifications & Bio (self-service, for doctor_detail.php) --
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update_bio'
+    && isset($_SESSION['staff_id']) && $_SESSION['staff_role'] === 'employee') {
+
+    $qualifications = trim($_POST['qualifications'] ?? '');
+    $bio            = trim($_POST['bio'] ?? '');
+
+    try {
+        $pdo  = getDbConnection();
+        $stmt = $pdo->prepare('UPDATE users SET qualifications = :quals, bio = :bio WHERE id = :id');
+        $stmt->execute([
+            ':quals' => $qualifications !== '' ? $qualifications : null,
+            ':bio'   => $bio !== '' ? $bio : null,
+            ':id'    => $_SESSION['staff_id'],
+        ]);
+        $success = t('success_bio_updated');
+    } catch (Throwable $e) {
+        $errors[] = t('err_bio_update');
+    }
+}
+
 // ---- Assign Bill to Patient (staff action) ------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add_bill'
     && isset($_SESSION['staff_id'])) {
@@ -252,6 +293,143 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             }
         } catch (Throwable $e) {
             $errors[] = t('err_bill_failed');
+        }
+    }
+}
+
+// ---- Verify Appointment Payment (staff/employee action) -----------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'verify_appointment'
+    && isset($_SESSION['staff_id'])) {
+
+    $apptId  = (int) ($_POST['appointment_id'] ?? 0);
+    $decision = $_POST['decision'] ?? 'confirm';
+
+    if (!in_array($decision, ['confirm', 'reject'], true)) {
+        $decision = 'confirm';
+    }
+
+    try {
+        $pdo = getDbConnection();
+        $newStatus = $decision === 'confirm' ? 'confirmed' : 'rejected';
+        $stmt = $pdo->prepare('UPDATE appointments SET status = :status, verified_by = :vid, verified_at = NOW()
+                                WHERE id = :id AND status = "pending_verification"');
+        $stmt->execute([':status' => $newStatus, ':vid' => $_SESSION['staff_id'], ':id' => $apptId]);
+
+        if ($decision === 'confirm' && $stmt->rowCount() > 0) {
+            $success = t('success_appt_confirmed');
+
+            // Best-effort confirmation email — a failure here should NOT
+            // undo the confirmation itself, just surface a note to staff.
+            try {
+                $detailStmt = $pdo->prepare('SELECT a.*, u.full_name AS doctor_name, u.specialty AS doctor_specialty
+                                              FROM appointments a
+                                              JOIN users u ON u.id = a.doctor_id
+                                              WHERE a.id = :id LIMIT 1');
+                $detailStmt->execute([':id' => $apptId]);
+                $fullAppt = $detailStmt->fetch();
+
+                $recipientName = null;
+                $recipientEmail = null;
+                if ($fullAppt) {
+                    if ($fullAppt['patient_id']) {
+                        $pstmt = $pdo->prepare('SELECT full_name, email FROM patients WHERE patient_id = :pid LIMIT 1');
+                        $pstmt->execute([':pid' => $fullAppt['patient_id']]);
+                        $prow = $pstmt->fetch();
+                        if ($prow) {
+                            $recipientName  = $prow['full_name'];
+                            $recipientEmail = $prow['email'];
+                        }
+                    } else {
+                        $recipientName  = $fullAppt['guest_name'];
+                        $recipientEmail = $fullAppt['guest_email'];
+                    }
+                }
+
+                if ($fullAppt && $recipientEmail) {
+                    require_once __DIR__ . '/send_appointment_confirmation.php';
+                    sendAppointmentConfirmationEmail($fullAppt, $recipientName, $recipientEmail);
+                } elseif ($fullAppt && !$recipientEmail) {
+                    $success .= ' ' . t('note_appt_no_email_on_file');
+                }
+            } catch (Throwable $mailEx) {
+                $success .= ' ' . t('note_appt_email_failed');
+            }
+        } else {
+            $success = t('success_appt_rejected');
+        }
+    } catch (Throwable $e) {
+        $errors[] = t('err_appt_verify_failed');
+    }
+}
+
+// ---- Update a Patient's Admission Status (staff/employee action) --------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update_admission'
+    && isset($_SESSION['staff_id'])) {
+
+    $admPatientId = trim($_POST['admission_patient_id'] ?? '');
+    $newAdmission = $_POST['admission_status'] ?? '';
+
+    if (!in_array($newAdmission, ['outpatient', 'admitted', 'discharged'], true)) {
+        $errors[] = t('err_admission_invalid');
+    } else {
+        try {
+            $pdo = getDbConnection();
+            $sql = 'UPDATE patients SET admission_status = :status';
+            $params = [':status' => $newAdmission, ':pid' => $admPatientId];
+            if ($newAdmission === 'admitted') {
+                $sql .= ', admitted_at = NOW(), discharged_at = NULL';
+            } elseif ($newAdmission === 'discharged') {
+                $sql .= ', discharged_at = NOW()';
+            }
+            $sql .= ' WHERE patient_id = :pid';
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            $success = t('success_admission_updated');
+        } catch (Throwable $e) {
+            $errors[] = t('err_admission_failed');
+        }
+    }
+}
+
+// ---- Add Research Project (employee/doctor action) ----------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add_research'
+    && isset($_SESSION['staff_id']) && $_SESSION['staff_role'] === 'employee') {
+
+    $specialty   = trim($_POST['research_specialty'] ?? '');
+    $title       = trim($_POST['research_title_field'] ?? '');
+    $authorName  = trim($_POST['research_author'] ?? '');
+    $status      = $_POST['research_status'] ?? 'ongoing';
+    $description = trim($_POST['research_description'] ?? '');
+    $conclusion  = trim($_POST['research_conclusion_field'] ?? '');
+    $startedDate = trim($_POST['research_started_date'] ?? '');
+
+    if (!in_array($status, ['ongoing', 'completed'], true)) {
+        $status = 'ongoing';
+    }
+
+    if ($specialty === '' || $title === '' || $description === '' || $startedDate === '' || strtotime($startedDate) === false) {
+        $errors[] = t('err_research_invalid');
+    } else {
+        try {
+            $pdo = getDbConnection();
+            $stmt = $pdo->prepare('INSERT INTO research_projects
+                (specialty, title, author_name, doctor_id, status, description, conclusion, started_date, completed_date, created_by)
+                VALUES (:sp, :title, :author, :doctor_id, :status, :desc, :conclusion, :started, :completed, :staff)');
+            $stmt->execute([
+                ':sp'        => $specialty,
+                ':title'     => $title,
+                ':author'    => $authorName !== '' ? $authorName : null,
+                ':doctor_id' => $_SESSION['staff_id'],
+                ':status'    => $status,
+                ':desc'      => $description,
+                ':conclusion'=> $status === 'completed' && $conclusion !== '' ? $conclusion : null,
+                ':started'   => $startedDate,
+                ':completed' => $status === 'completed' ? date('Y-m-d') : null,
+                ':staff'     => $_SESSION['staff_id'],
+            ]);
+            $success = t('success_research_added');
+        } catch (Throwable $e) {
+            $errors[] = t('err_research_failed');
         }
     }
 }
@@ -293,21 +471,94 @@ if (isset($_GET['logout']) && $_GET['logout'] === 'patient') {
    DATA FETCH FOR AUTHENTICATED VIEWS
    ========================================================================= */
 
-$staffPatients = [];
+$staffPatients = [];         // full list — used for the "Assign Bill" dropdown
+$staffPatientsFiltered = []; // search-filtered list — used for the display table
 $currentDoctor = null;
+$staffJoinedDate = null;
+$patientSearch = trim($_GET['patient_q'] ?? '');
 if (isset($_SESSION['staff_id'])) {
     try {
         $pdo  = getDbConnection();
-        $stmt = $pdo->prepare('SELECT patient_id, full_name, date_of_birth, gender, contact_info, created_at
+        $stmt = $pdo->prepare('SELECT patient_id, full_name, date_of_birth, gender, contact_info, admission_status, created_at
                                 FROM patients WHERE registered_by = :sid ORDER BY created_at DESC');
         $stmt->execute([':sid' => $_SESSION['staff_id']]);
         $staffPatients = $stmt->fetchAll();
 
+        if ($patientSearch !== '') {
+            $needle = mb_strtolower($patientSearch);
+            $staffPatientsFiltered = array_values(array_filter($staffPatients, function ($p) use ($needle) {
+                return strpos(mb_strtolower($p['full_name']), $needle) !== false
+                    || strpos(mb_strtolower($p['patient_id']), $needle) !== false;
+            }));
+        } else {
+            $staffPatientsFiltered = $staffPatients;
+        }
+
         if ($_SESSION['staff_role'] === 'employee') {
-            $stmt2 = $pdo->prepare('SELECT specialty, availability FROM users WHERE id = :id LIMIT 1');
+            $stmt2 = $pdo->prepare('SELECT specialty, availability, qualifications, bio FROM users WHERE id = :id LIMIT 1');
             $stmt2->execute([':id' => $_SESSION['staff_id']]);
             $currentDoctor = $stmt2->fetch();
         }
+
+        $stmt3 = $pdo->prepare('SELECT created_at FROM users WHERE id = :id LIMIT 1');
+        $stmt3->execute([':id' => $_SESSION['staff_id']]);
+        $currentStaffRow = $stmt3->fetch();
+        $staffJoinedDate = $currentStaffRow ? $currentStaffRow['created_at'] : null;
+    } catch (Throwable $e) {
+        // silently ignore for demo purposes
+    }
+}
+
+// Doctor's own confirmed appointments for today and tomorrow.
+$doctorAppointments = [];
+if (isset($_SESSION['staff_id']) && $_SESSION['staff_role'] === 'employee') {
+    try {
+        $pdo = getDbConnection();
+        $stmt = $pdo->prepare("SELECT a.*, COALESCE(p.full_name, a.guest_name) AS patient_name
+                                FROM appointments a
+                                LEFT JOIN patients p ON p.patient_id = a.patient_id
+                                WHERE a.doctor_id = :did AND a.status = 'confirmed'
+                                  AND a.appointment_date IN (CURDATE(), CURDATE() + INTERVAL 1 DAY)
+                                ORDER BY a.appointment_date ASC, a.appointment_time ASC");
+        $stmt->execute([':did' => $_SESSION['staff_id']]);
+        $doctorAppointments = $stmt->fetchAll();
+    } catch (Throwable $e) {
+        // silently ignore for demo purposes
+    }
+}
+
+// Staff-wide: appointments awaiting payment verification (any doctor).
+$pendingVerifications = [];
+if (isset($_SESSION['staff_id'])) {
+    try {
+        $pdo = getDbConnection();
+        $stmt = $pdo->query("SELECT a.*, COALESCE(p.full_name, a.guest_name) AS patient_name, u.full_name AS doctor_name
+                              FROM appointments a
+                              LEFT JOIN patients p ON p.patient_id = a.patient_id
+                              JOIN users u ON u.id = a.doctor_id
+                              WHERE a.status = 'pending_verification'
+                              ORDER BY a.created_at ASC");
+        $pendingVerifications = $stmt->fetchAll();
+    } catch (Throwable $e) {
+        // silently ignore for demo purposes
+    }
+}
+
+// Hospital-wide admission census — staff/doctor view ONLY (never public).
+$admittedToday = [];
+$currentlyAdmitted = [];
+if (isset($_SESSION['staff_id'])) {
+    try {
+        $pdo = getDbConnection();
+        $stmt = $pdo->query("SELECT patient_id, full_name, admitted_at FROM patients
+                              WHERE admission_status = 'admitted' AND DATE(admitted_at) = CURDATE()
+                              ORDER BY admitted_at DESC");
+        $admittedToday = $stmt->fetchAll();
+
+        $stmt2 = $pdo->query("SELECT patient_id, full_name, admitted_at FROM patients
+                               WHERE admission_status = 'admitted'
+                               ORDER BY admitted_at DESC");
+        $currentlyAdmitted = $stmt2->fetchAll();
     } catch (Throwable $e) {
         // silently ignore for demo purposes
     }
@@ -317,6 +568,7 @@ $patientProfile = null;
 $patientRecords = [];
 $patientBills   = [];
 $patientBillsTotal = 0.0;
+$patientAppointments = [];
 if (isset($_SESSION['patient_pk'])) {
     try {
         $pdo  = getDbConnection();
@@ -335,6 +587,14 @@ if (isset($_SESSION['patient_pk'])) {
             foreach ($patientBills as $b) {
                 $patientBillsTotal += (float) $b['amount'];
             }
+
+            $stmt4 = $pdo->prepare("SELECT a.*, u.full_name AS doctor_name, u.specialty AS doctor_specialty
+                                     FROM appointments a
+                                     JOIN users u ON u.id = a.doctor_id
+                                     WHERE a.patient_id = :pid
+                                     ORDER BY a.appointment_date DESC, a.appointment_time DESC");
+            $stmt4->execute([':pid' => $patientProfile['patient_id']]);
+            $patientAppointments = $stmt4->fetchAll();
         }
     } catch (Throwable $e) {
         // silently ignore for demo purposes
@@ -368,6 +628,13 @@ $roleLabels = [
   .topbar{ background:var(--brand-dark); color:#fff; padding:14px 0; }
   .topbar a{ color:#fff; text-decoration:none; }
   .card-auth{ border:none; border-radius:18px; box-shadow:0 10px 30px rgba(11,46,74,.08); }
+
+  .id-card{ position:relative; background:#fff; border-radius:18px; padding:24px 28px; box-shadow:0 10px 30px rgba(11,46,74,.1); overflow:hidden; cursor:pointer; transition:.2s; }
+  .id-card:hover{ transform:translateY(-3px); box-shadow:0 16px 36px rgba(11,46,74,.16); }
+  .id-card-strip{ position:absolute; top:0; left:0; right:0; height:8px; background:linear-gradient(90deg, var(--brand-primary), var(--brand-secondary)); }
+  .id-card-avatar{ width:64px; height:64px; border-radius:50%; background:var(--brand-light); color:var(--brand-primary); display:flex; align-items:center; justify-content:center; font-size:1.8rem; flex-shrink:0; }
+  .id-card-details{ padding-left:16px; border-left:1px solid #e7eef3; }
+  @media (max-width: 767px){ .id-card-details{ border-left:none; padding-left:0; text-align:left !important; } }
   .btn-brand{ background:var(--brand-primary); border:none; color:#fff; font-weight:600; }
   .btn-brand:hover{ background:var(--brand-dark); color:#fff; }
   .role-pill{ background:rgba(13,110,168,.1); color:var(--brand-primary); font-weight:600; padding:4px 14px; border-radius:20px; font-size:.8rem; display:inline-block; }
@@ -427,7 +694,7 @@ $roleLabels = [
          ========================================================================== */ ?>
 <?php if ($role === 'employee' || $role === 'staff'): ?>
 
-  <?php if (!isset($_SESSION['staff_id'])): ?>
+  <?php if (!$isStaffLoggedInForThisRole): ?>
     <!-- ---------- STAFF LOGIN FORM ---------- -->
     <div class="row justify-content-center">
       <div class="col-md-5">
@@ -466,6 +733,29 @@ $roleLabels = [
         <i class="bi bi-box-arrow-right me-1"></i> <?= htmlspecialchars(t('portal_logout')) ?>
       </a>
     </div>
+
+    <!-- Virtual ID Card -->
+    <a href="id_card.php" class="id-card mb-4 text-decoration-none d-block" title="<?= htmlspecialchars(t('id_card_view_hint')) ?>">
+      <div class="id-card-strip"></div>
+      <div class="d-flex align-items-center gap-3 flex-wrap">
+        <div class="id-card-avatar">
+          <i class="bi <?= $_SESSION['staff_role'] === 'employee' ? 'bi-person-badge' : 'bi-heart-pulse' ?>"></i>
+        </div>
+        <div class="flex-grow-1">
+          <div class="text-muted small text-uppercase fw-semibold" style="letter-spacing:1px;"><?= htmlspecialchars(t('hospital_name')) ?></div>
+          <h4 class="fw-bold mb-0" style="color:var(--brand-dark);"><?= htmlspecialchars($_SESSION['staff_name']) ?></h4>
+          <div class="text-muted small"><?= $_SESSION['staff_role'] === 'employee' ? htmlspecialchars(t('login_doctor')) : htmlspecialchars(t('login_staff')) ?><?php if ($_SESSION['staff_role'] === 'employee' && !empty($currentDoctor['specialty'])): ?> &middot; <?= htmlspecialchars($currentDoctor['specialty']) ?><?php endif; ?></div>
+        </div>
+        <div class="id-card-details text-md-end">
+          <div class="text-muted small"><?= htmlspecialchars(t('id_card_employee_id')) ?></div>
+          <div class="fw-bold font-monospace" style="color:var(--brand-dark);"><?= htmlspecialchars($_SESSION['staff_username']) ?></div>
+          <?php if ($staffJoinedDate): ?>
+            <div class="text-muted small mt-1"><?= htmlspecialchars(t('id_card_since')) ?> <?= htmlspecialchars(date('M Y', strtotime($staffJoinedDate))) ?></div>
+          <?php endif; ?>
+          <div class="small mt-2" style="color:var(--brand-primary);"><i class="bi bi-person-vcard me-1"></i><?= htmlspecialchars(t('id_card_view_hint')) ?></div>
+        </div>
+      </div>
+    </a>
 
     <div class="alert d-flex align-items-center gap-2" style="background:rgba(18,184,166,.1); border:1px solid rgba(18,184,166,.3);">
       <span class="badge badge-rights rounded-pill px-3 py-2">
@@ -512,6 +802,109 @@ $roleLabels = [
         <div class="col-12">
           <button type="submit" class="btn btn-brand rounded-pill px-4">
             <i class="bi bi-save2 me-1"></i> <?= htmlspecialchars(t('portal_update_status')) ?>
+          </button>
+        </div>
+      </form>
+    </div>
+    <?php endif; ?>
+
+    <?php if ($_SESSION['staff_role'] === 'employee'): ?>
+    <div class="card card-auth p-4 mb-4">
+      <h5 class="section-title mb-1"><i class="bi bi-person-lines-fill me-1"></i> <?= htmlspecialchars(t('portal_bio_title')) ?></h5>
+      <p class="text-muted small mb-3"><?= htmlspecialchars(t('portal_bio_subtitle')) ?></p>
+      <form method="POST" action="portal.php?role=<?= htmlspecialchars($role) ?>" class="row g-3">
+        <input type="hidden" name="action" value="update_bio">
+        <div class="col-md-6">
+          <label class="form-label"><?= htmlspecialchars(t('portal_qualifications')) ?></label>
+          <input type="text" name="qualifications" class="form-control" placeholder="<?= htmlspecialchars(t('portal_qualifications_ph')) ?>" value="<?= htmlspecialchars($currentDoctor['qualifications'] ?? '') ?>">
+        </div>
+        <div class="col-12">
+          <label class="form-label"><?= htmlspecialchars(t('portal_bio')) ?></label>
+          <textarea name="bio" class="form-control" rows="3" placeholder="<?= htmlspecialchars(t('portal_bio_ph')) ?>"><?= htmlspecialchars($currentDoctor['bio'] ?? '') ?></textarea>
+        </div>
+        <div class="col-12">
+          <button type="submit" class="btn btn-brand rounded-pill px-4">
+            <i class="bi bi-save2 me-1"></i> <?= htmlspecialchars(t('portal_update_bio_btn')) ?>
+          </button>
+        </div>
+      </form>
+    </div>
+    <?php endif; ?>
+
+    <?php if ($_SESSION['staff_role'] === 'employee'): ?>
+    <div class="card card-auth p-4 mb-4">
+      <h5 class="section-title mb-3"><i class="bi bi-calendar-week me-1"></i> <?= htmlspecialchars(t('portal_my_appointments_title')) ?></h5>
+      <?php if (!$doctorAppointments): ?>
+        <p class="text-muted small"><?= htmlspecialchars(t('portal_no_appointments')) ?></p>
+      <?php else: ?>
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead><tr><th><?= htmlspecialchars(t('appt_date')) ?></th><th><?= htmlspecialchars(t('appt_time')) ?></th><th><?= htmlspecialchars(t('portal_full_name')) ?></th><th><?= htmlspecialchars(t('appt_reason')) ?></th></tr></thead>
+            <tbody>
+              <?php foreach ($doctorAppointments as $ap): ?>
+                <tr>
+                  <td>
+                    <?= $ap['appointment_date'] === date('Y-m-d') ? '<span class="badge bg-primary">' . htmlspecialchars(t('portal_today')) . '</span>' : '<span class="badge bg-secondary">' . htmlspecialchars(t('portal_tomorrow')) . '</span>' ?>
+                    <span class="text-muted small ms-1"><?= htmlspecialchars(date('M j', strtotime($ap['appointment_date']))) ?></span>
+                  </td>
+                  <td><?= htmlspecialchars(date('g:i A', strtotime($ap['appointment_time']))) ?></td>
+                  <td class="fw-semibold"><?= htmlspecialchars($ap['patient_name']) ?><?= !$ap['patient_id'] ? ' <span class="badge bg-light text-dark border">Guest</span>' : '' ?></td>
+                  <td class="text-muted small"><?= htmlspecialchars($ap['reason'] ?? '—') ?></td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <?php if ($_SESSION['staff_role'] === 'employee'): ?>
+    <div class="card card-auth p-4 mb-4">
+      <h5 class="section-title mb-3"><i class="bi bi-journal-medical me-1"></i> <?= htmlspecialchars(t('portal_add_research_title')) ?></h5>
+      <form method="POST" action="portal.php?role=<?= htmlspecialchars($role) ?>" class="row g-3">
+        <input type="hidden" name="action" value="add_research">
+        <div class="col-md-6">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_specialty')) ?> *</label>
+          <select name="research_specialty" class="form-select" required>
+            <option value="" disabled selected><?= htmlspecialchars(t('appt_choose_doctor_ph')) ?></option>
+            <?php foreach ($specialties as $sp): ?>
+              <option value="<?= htmlspecialchars($sp['en_title']) ?>" <?= (!empty($currentDoctor['specialty']) && $currentDoctor['specialty'] === $sp['en_title']) ? 'selected' : '' ?>>
+                <?= htmlspecialchars(currentLang() === 'mr' ? $sp['mr_title'] : $sp['en_title']) ?>
+              </option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_title')) ?> *</label>
+          <input type="text" name="research_title_field" class="form-control" required>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_author')) ?></label>
+          <input type="text" name="research_author" class="form-control">
+        </div>
+        <div class="col-md-3">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_status')) ?></label>
+          <select name="research_status" class="form-select">
+            <option value="ongoing"><?= htmlspecialchars(t('research_ongoing')) ?></option>
+            <option value="completed"><?= htmlspecialchars(t('research_completed')) ?></option>
+          </select>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_started')) ?> *</label>
+          <input type="date" name="research_started_date" class="form-control" max="<?= date('Y-m-d') ?>" required>
+        </div>
+        <div class="col-12">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_description')) ?> *</label>
+          <textarea name="research_description" class="form-control" rows="2" required></textarea>
+        </div>
+        <div class="col-12">
+          <label class="form-label"><?= htmlspecialchars(t('research_field_conclusion')) ?> <span class="text-muted small">(<?= htmlspecialchars(t('research_completed')) ?>)</span></label>
+          <textarea name="research_conclusion_field" class="form-control" rows="2"></textarea>
+        </div>
+        <div class="col-12">
+          <button type="submit" class="btn btn-brand rounded-pill px-4">
+            <i class="bi bi-plus-lg me-1"></i> <?= htmlspecialchars(t('research_add_btn')) ?>
           </button>
         </div>
       </form>
@@ -608,24 +1001,48 @@ $roleLabels = [
           <?php if (!$staffPatients): ?>
             <p class="text-muted small"><?= htmlspecialchars(t('portal_no_patients')) ?></p>
           <?php else: ?>
+            <form method="GET" action="portal.php" class="d-flex gap-2 mb-3">
+              <input type="hidden" name="role" value="<?= htmlspecialchars($role) ?>">
+              <input type="text" name="patient_q" class="form-control form-control-sm" placeholder="<?= htmlspecialchars(t('portal_search_patients_ph')) ?>" value="<?= htmlspecialchars($patientSearch) ?>">
+              <button type="submit" class="btn btn-brand btn-sm rounded-pill px-3"><i class="bi bi-search"></i></button>
+              <?php if ($patientSearch !== ''): ?>
+                <a href="portal.php?role=<?= htmlspecialchars($role) ?>" class="btn btn-outline-secondary btn-sm rounded-pill px-3"><i class="bi bi-x-lg"></i></a>
+              <?php endif; ?>
+            </form>
+            <?php if (!$staffPatientsFiltered): ?>
+              <p class="text-muted small"><?= htmlspecialchars(t('portal_no_patients_match')) ?></p>
+            <?php else: ?>
             <div class="table-responsive">
               <table class="table table-sm align-middle">
                 <thead>
-                  <tr><th><?= htmlspecialchars(t('portal_patient_id')) ?></th><th><?= htmlspecialchars(t('portal_full_name')) ?></th><th><?= htmlspecialchars(t('portal_dob')) ?></th><th><?= htmlspecialchars(t('portal_gender')) ?></th><th><?= htmlspecialchars(t('portal_contact_info')) ?></th></tr>
+                  <tr><th><?= htmlspecialchars(t('portal_patient_id')) ?></th><th><?= htmlspecialchars(t('portal_full_name')) ?></th><th><?= htmlspecialchars(t('portal_dob')) ?></th><th><?= htmlspecialchars(t('portal_gender')) ?></th><th><?= htmlspecialchars(t('portal_contact_info')) ?></th><th><?= htmlspecialchars(t('portal_admission_status')) ?></th></tr>
                 </thead>
                 <tbody>
-                <?php foreach ($staffPatients as $p): ?>
+                <?php foreach ($staffPatientsFiltered as $p): ?>
                   <tr>
                     <td class="fw-semibold"><?= htmlspecialchars($p['patient_id']) ?></td>
                     <td><?= htmlspecialchars($p['full_name']) ?></td>
                     <td><?= htmlspecialchars($p['date_of_birth']) ?></td>
                     <td><?= htmlspecialchars($p['gender']) ?></td>
                     <td><?= htmlspecialchars($p['contact_info']) ?></td>
+                    <td>
+                      <form method="POST" action="portal.php?role=<?= htmlspecialchars($role) ?>" class="d-flex gap-1">
+                        <input type="hidden" name="action" value="update_admission">
+                        <input type="hidden" name="admission_patient_id" value="<?= htmlspecialchars($p['patient_id']) ?>">
+                        <select name="admission_status" class="form-select form-select-sm" onchange="this.form.submit()" style="min-width:130px;">
+                          <option value="outpatient" <?= $p['admission_status'] === 'outpatient' ? 'selected' : '' ?>><?= htmlspecialchars(t('portal_admission_outpatient')) ?></option>
+                          <option value="admitted" <?= $p['admission_status'] === 'admitted' ? 'selected' : '' ?>><?= htmlspecialchars(t('portal_admission_admitted')) ?></option>
+                          <option value="discharged" <?= $p['admission_status'] === 'discharged' ? 'selected' : '' ?>><?= htmlspecialchars(t('portal_admission_discharged')) ?></option>
+                        </select>
+                        <noscript><button type="submit" class="btn btn-brand btn-sm rounded-pill">OK</button></noscript>
+                      </form>
+                    </td>
                   </tr>
                 <?php endforeach; ?>
                 </tbody>
               </table>
             </div>
+            <?php endif; ?>
           <?php endif; ?>
         </div>
       </div>
@@ -663,6 +1080,88 @@ $roleLabels = [
                 <i class="bi bi-receipt-cutoff me-1"></i> <?= htmlspecialchars(t('portal_add_bill_btn')) ?>
               </button>
             </form>
+          <?php endif; ?>
+        </div>
+      </div>
+    </div>
+
+    <!-- Pending appointment payment verifications (any doctor) -->
+    <div class="card card-auth p-4 mt-4">
+      <h5 class="section-title mb-3"><i class="bi bi-patch-check me-1"></i> <?= htmlspecialchars(t('portal_pending_verifications_title')) ?></h5>
+      <?php if (!$pendingVerifications): ?>
+        <p class="text-muted small"><?= htmlspecialchars(t('portal_no_pending_verifications')) ?></p>
+      <?php else: ?>
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead>
+              <tr><th><?= htmlspecialchars(t('portal_full_name')) ?></th><th><?= htmlspecialchars(t('appt_choose_doctor')) ?></th><th><?= htmlspecialchars(t('appt_date')) ?></th><th><?= htmlspecialchars(t('appt_fee_label')) ?></th><th><?= htmlspecialchars(t('portal_proof')) ?></th><th></th></tr>
+            </thead>
+            <tbody>
+              <?php foreach ($pendingVerifications as $pv): ?>
+                <tr>
+                  <td class="fw-semibold">
+                    <?= htmlspecialchars($pv['patient_name']) ?>
+                    <?php if (!$pv['patient_id'] && $pv['guest_contact']): ?>
+                      <div class="text-muted small fw-normal"><i class="bi bi-telephone me-1"></i><?= htmlspecialchars($pv['guest_contact']) ?> <span class="badge bg-light text-dark border">Guest</span></div>
+                    <?php endif; ?>
+                  </td>
+                  <td>Dr. <?= htmlspecialchars($pv['doctor_name']) ?></td>
+                  <td class="text-muted small"><?= htmlspecialchars(date('M j, Y g:i A', strtotime($pv['appointment_date'] . ' ' . $pv['appointment_time']))) ?></td>
+                  <td>₹<?= number_format((float)$pv['fee'], 2) ?></td>
+                  <td>
+                    <a href="view_payment_proof.php?id=<?= (int)$pv['id'] ?>" target="_blank" class="btn btn-outline-secondary btn-sm rounded-pill">
+                      <i class="bi bi-image me-1"></i> <?= htmlspecialchars(t('portal_view_screenshot')) ?>
+                    </a>
+                  </td>
+                  <td class="text-end">
+                    <form method="POST" action="portal.php?role=<?= htmlspecialchars($role) ?>" class="d-flex gap-1">
+                      <input type="hidden" name="action" value="verify_appointment">
+                      <input type="hidden" name="appointment_id" value="<?= (int)$pv['id'] ?>">
+                      <button type="submit" name="decision" value="confirm" class="btn btn-success btn-sm rounded-pill"><i class="bi bi-check-lg"></i></button>
+                      <button type="submit" name="decision" value="reject" class="btn btn-outline-danger btn-sm rounded-pill"><i class="bi bi-x-lg"></i></button>
+                    </form>
+                  </td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      <?php endif; ?>
+    </div>
+
+    <!-- Admission census — staff/doctor only, never shown on the public site -->
+    <div class="row g-4 mt-1">
+      <div class="col-lg-6">
+        <div class="card card-auth p-4 h-100">
+          <h5 class="section-title mb-3"><i class="bi bi-calendar-plus me-1"></i> <?= htmlspecialchars(t('portal_admitted_today_title')) ?></h5>
+          <?php if (!$admittedToday): ?>
+            <p class="text-muted small"><?= htmlspecialchars(t('portal_no_admissions_today')) ?></p>
+          <?php else: ?>
+            <ul class="list-unstyled mb-0">
+              <?php foreach ($admittedToday as $a): ?>
+                <li class="d-flex justify-content-between border-bottom py-2">
+                  <span><?= htmlspecialchars($a['full_name']) ?> <span class="text-muted small">(<?= htmlspecialchars($a['patient_id']) ?>)</span></span>
+                  <span class="text-muted small"><?= htmlspecialchars(date('g:i A', strtotime($a['admitted_at']))) ?></span>
+                </li>
+              <?php endforeach; ?>
+            </ul>
+          <?php endif; ?>
+        </div>
+      </div>
+      <div class="col-lg-6">
+        <div class="card card-auth p-4 h-100">
+          <h5 class="section-title mb-3"><i class="bi bi-hospital me-1"></i> <?= htmlspecialchars(t('portal_currently_admitted_title')) ?></h5>
+          <?php if (!$currentlyAdmitted): ?>
+            <p class="text-muted small"><?= htmlspecialchars(t('portal_no_current_admissions')) ?></p>
+          <?php else: ?>
+            <ul class="list-unstyled mb-0">
+              <?php foreach ($currentlyAdmitted as $a): ?>
+                <li class="d-flex justify-content-between border-bottom py-2">
+                  <span><?= htmlspecialchars($a['full_name']) ?> <span class="text-muted small">(<?= htmlspecialchars($a['patient_id']) ?>)</span></span>
+                  <span class="text-muted small"><?= htmlspecialchars(date('M j', strtotime($a['admitted_at']))) ?></span>
+                </li>
+              <?php endforeach; ?>
+            </ul>
           <?php endif; ?>
         </div>
       </div>
@@ -712,9 +1211,14 @@ $roleLabels = [
         <h3 class="section-title mb-0"><?= htmlspecialchars(t('portal_welcome')) ?>, <?= htmlspecialchars($patientProfile['full_name']) ?></h3>
         <span class="text-muted small"><?= htmlspecialchars(t('portal_patient_id')) ?>: <?= htmlspecialchars($patientProfile['patient_id']) ?></span>
       </div>
-      <a href="portal.php?role=patient&logout=patient" class="btn btn-outline-danger rounded-pill">
-        <i class="bi bi-box-arrow-right me-1"></i> <?= htmlspecialchars(t('portal_logout')) ?>
-      </a>
+      <div class="d-flex gap-2">
+        <a href="book_appointment.php" class="btn btn-brand rounded-pill">
+          <i class="bi bi-calendar-plus me-1"></i> <?= htmlspecialchars(t('appt_book_title')) ?>
+        </a>
+        <a href="portal.php?role=patient&logout=patient" class="btn btn-outline-danger rounded-pill">
+          <i class="bi bi-box-arrow-right me-1"></i> <?= htmlspecialchars(t('portal_logout')) ?>
+        </a>
+      </div>
     </div>
 
     <div class="alert alert-info small">
@@ -722,6 +1226,50 @@ $roleLabels = [
     </div>
 
     <div class="row g-4">
+      <div class="col-lg-12">
+        <div class="card card-auth p-4">
+          <h5 class="section-title mb-3"><i class="bi bi-calendar-week me-1"></i> <?= htmlspecialchars(t('portal_my_appointments_title')) ?></h5>
+          <?php if (!$patientAppointments): ?>
+            <p class="text-muted small"><?= htmlspecialchars(t('portal_no_appointments')) ?></p>
+          <?php else: ?>
+            <?php
+              $apptStatusLabels = [
+                'pending_payment'      => t('appt_status_pending_payment'),
+                'pending_verification' => t('appt_status_pending_verification'),
+                'confirmed'             => t('appt_status_confirmed'),
+                'rejected'              => t('appt_status_rejected'),
+              ];
+              $apptStatusColors = [
+                'pending_payment'      => 'bg-warning text-dark',
+                'pending_verification' => 'bg-info text-dark',
+                'confirmed'             => 'bg-success',
+                'rejected'              => 'bg-danger',
+              ];
+            ?>
+            <div class="table-responsive">
+              <table class="table table-sm align-middle">
+                <thead><tr><th><?= htmlspecialchars(t('appt_choose_doctor')) ?></th><th><?= htmlspecialchars(t('appt_date')) ?></th><th><?= htmlspecialchars(t('appt_time')) ?></th><th><?= htmlspecialchars(t('portal_status')) ?></th><th></th></tr></thead>
+                <tbody>
+                <?php foreach ($patientAppointments as $ap): ?>
+                  <tr>
+                    <td>Dr. <?= htmlspecialchars($ap['doctor_name']) ?><?= $ap['doctor_specialty'] ? ' — ' . htmlspecialchars($ap['doctor_specialty']) : '' ?></td>
+                    <td><?= htmlspecialchars(date('M j, Y', strtotime($ap['appointment_date']))) ?></td>
+                    <td><?= htmlspecialchars(date('g:i A', strtotime($ap['appointment_time']))) ?></td>
+                    <td><span class="badge <?= $apptStatusColors[$ap['status']] ?>"><?= htmlspecialchars($apptStatusLabels[$ap['status']]) ?></span></td>
+                    <td>
+                      <?php if ($ap['status'] === 'pending_payment'): ?>
+                        <a href="appointment_payment.php?id=<?= (int)$ap['id'] ?>" class="btn btn-brand btn-sm rounded-pill"><?= htmlspecialchars(t('appt_pay_now')) ?></a>
+                      <?php endif; ?>
+                    </td>
+                  </tr>
+                <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+        </div>
+      </div>
+
       <div class="col-lg-12">
         <div class="card card-auth p-4">
           <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">

@@ -5,7 +5,7 @@
  */
 session_start();
 require_once __DIR__ . '/db_config.php';
-const HOSPITAL_NAME = "Sunrise General Hospital";
+const HOSPITAL_NAME = "Sassoon General Hospital, Pune";
 
 // Must be logged in as a patient to order.
 if (!isset($_SESSION['patient_pk'])) {

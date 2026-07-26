@@ -4,6 +4,7 @@
  * Change the hospital name in ONE place below.
  */
 session_start();
+require_once __DIR__ . '/db_config.php';
 require_once __DIR__ . '/translations.php';
 /*wenesdays stop*/
 const HOSPITAL_NAME = " Sassoon General Hospital, Pune"; // English fallback for pages without translations.php
@@ -15,6 +16,17 @@ if (!isset($_SESSION['lang'])) {
 }
 
 $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on the visitor's choice
+
+// Anonymized, aggregate-only count for the public homepage — deliberately
+// NO names or identifying details here (that stays on the staff/doctor
+// dashboard in portal.php). See project notes on patient confidentiality.
+$admittedCount = null;
+try {
+    $pdo = getDbConnection();
+    $admittedCount = (int) $pdo->query("SELECT COUNT(*) FROM patients WHERE admission_status = 'admitted'")->fetchColumn();
+} catch (Throwable $e) {
+    // silently ignore for demo purposes
+}
 ?>
 <!DOCTYPE html>
 <html lang="<?= currentLang() ?>">
@@ -75,6 +87,15 @@ $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on
 
   .about-img-placeholder{ background:var(--brand-light); border-radius:20px; min-height:340px; display:flex; align-items:center; justify-content:center; color:var(--brand-primary); font-size:3rem; }
 
+  .testimonial-card{ border:none; border-radius:16px; padding:30px 26px; height:100%; box-shadow:0 4px 18px rgba(13,110,168,.08); }
+  .testimonial-quote-icon{ color:var(--brand-secondary); font-size:1.6rem; }
+  .testimonial-stars{ color:#f5a623; font-size:.9rem; }
+  .testimonial-author{ font-weight:700; color:var(--brand-dark); }
+
+  .gallery-img{ border-radius:16px; overflow:hidden; height:260px; box-shadow:0 4px 18px rgba(13,110,168,.08); }
+  .gallery-img img{ width:100%; height:100%; object-fit:cover; transition:.3s; }
+  .gallery-img:hover img{ transform:scale(1.06); }
+
   footer{ background:var(--brand-dark); color:#cfe3f0; padding:40px 0; }
   footer a{ color:#cfe3f0; }
 
@@ -100,8 +121,8 @@ $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on
     </button>
     <div class="collapse navbar-collapse" id="mainNav">
       <ul class="navbar-nav ms-auto align-items-lg-center gap-lg-3">
-        <li class="nav-item"><a class="nav-link" href="#about"><?= htmlspecialchars(t('nav_about')) ?></a></li>
         <li class="nav-item"><a class="nav-link" href="#services"><?= htmlspecialchars(t('nav_services')) ?></a></li>
+        <li class="nav-item"><a class="nav-link" href="doctors.php"><?= htmlspecialchars(t('nav_doctors')) ?></a></li>
         <li class="nav-item"><a class="nav-link" href="research.php"><?= htmlspecialchars(t('nav_research')) ?></a></li>
         <li class="nav-item"><a class="nav-link" href="pharmacy.php"><?= htmlspecialchars(t('nav_pharmacy')) ?></a></li>
         <li class="nav-item"><a class="nav-link" href="#contact"><?= htmlspecialchars(t('nav_contact')) ?></a></li>
@@ -129,7 +150,7 @@ $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on
         <h1><?= htmlspecialchars($HOSPITAL_NAME) ?></h1>
         <p class="lead"><?= htmlspecialchars(t('hero_lead')) ?></p>
         <div class="d-flex gap-3 mt-4">
-          <a href="#contact" class="btn btn-light btn-lg rounded-pill px-4 fw-semibold"><?= htmlspecialchars(t('hero_book')) ?></a>
+          <a href="book_appointment.php" class="btn btn-light btn-lg rounded-pill px-4 fw-semibold"><?= htmlspecialchars(t('hero_book')) ?></a>
           <a href="#services" class="btn btn-outline-light btn-lg rounded-pill px-4"><?= htmlspecialchars(t('hero_services')) ?></a>
         </div>
       </div>
@@ -141,6 +162,23 @@ $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on
     </div>
   </div>
 </header>
+
+<!-- ===================== QUICK STATS (anonymized — no patient names/details) ===================== -->
+<div class="py-4" style="background:var(--brand-dark); color:#fff;">
+  <div class="container d-flex flex-wrap justify-content-center gap-5 text-center">
+    <?php if ($admittedCount !== null): ?>
+      <div>
+        <div class="fw-bold" style="font-size:1.8rem;"><?= (int)$admittedCount ?></div>
+        <div class="small" style="color:#dfeefa;"><?= htmlspecialchars(t('stats_patients_under_care')) ?></div>
+      </div>
+    <?php endif; ?>
+    <div>
+      <a href="doctors.php" class="text-white text-decoration-none">
+        <i class="bi bi-person-badge me-1"></i> <?= htmlspecialchars(t('stats_view_doctors')) ?>
+      </a>
+    </div>
+  </div>
+</div>
 
 <!-- ===================== ABOUT US ===================== -->
 <section id="about">
@@ -189,6 +227,62 @@ $HOSPITAL_NAME = t('hospital_name'); // shows in English or Marathi depending on
         </div>
       <?php endforeach; ?>
     </div>
+  </div>
+</section>
+
+<!-- ===================== GALLERY ===================== -->
+<section id="gallery" class="bg-light">
+  <div class="container">
+    <div class="text-center mb-5">
+      <div class="section-eyebrow"><?= htmlspecialchars(t('gallery_eyebrow')) ?></div>
+      <h2 class="section-title"><?= htmlspecialchars(t('gallery_title')) ?></h2>
+      <p class="text-muted"><?= htmlspecialchars(t('gallery_intro')) ?></p>
+    </div>
+    <div class="row g-4">
+      <div class="col-md-4">
+        <div class="gallery-img"><img src="sassoon.jpg" alt="Hospital building exterior"></div>
+      </div>
+      <div class="col-md-4">
+        <div class="gallery-img"><img src="sassooon.jpg" alt="Hospital corridor"></div>
+      </div>
+      <div class="col-md-4">
+        <div class="gallery-img"><img src="uro.jpg" alt="Department illustration"></div>
+      </div>
+    </div>
+    <p class="text-muted small mt-3 mb-0">[Placeholder gallery — swap these images out for your own hospital photos.]</p>
+  </div>
+</section>
+
+<!-- ===================== TESTIMONIALS ===================== -->
+<section id="testimonials">
+  <div class="container">
+    <div class="text-center mb-5">
+      <div class="section-eyebrow"><?= htmlspecialchars(t('testimonials_eyebrow')) ?></div>
+      <h2 class="section-title"><?= htmlspecialchars(t('testimonials_title')) ?></h2>
+      <p class="text-muted"><?= htmlspecialchars(t('testimonials_intro')) ?></p>
+    </div>
+    <div class="row g-4">
+      <?php
+        $testimonials = [
+          ['quote' => 'The doctors and nursing staff were incredibly attentive throughout my treatment. I felt genuinely cared for.', 'author' => 'Patient, Cardiology Dept.'],
+          ['quote' => 'From registration to discharge, the process was smooth and well organized. Highly recommend this hospital.', 'author' => 'Patient, Orthopedics Dept.'],
+          ['quote' => 'The pharmacy delivery service saved me a trip during recovery — a small thing that made a big difference.', 'author' => 'Patient, General Medicine'],
+        ];
+      ?>
+      <?php foreach ($testimonials as $ts): ?>
+        <div class="col-md-4">
+          <div class="testimonial-card bg-white">
+            <i class="bi bi-quote testimonial-quote-icon"></i>
+            <p class="text-muted mt-2">"<?= htmlspecialchars($ts['quote']) ?>"</p>
+            <div class="testimonial-stars mb-2">
+              <i class="bi bi-star-fill"></i><i class="bi bi-star-fill"></i><i class="bi bi-star-fill"></i><i class="bi bi-star-fill"></i><i class="bi bi-star-fill"></i>
+            </div>
+            <div class="testimonial-author">— <?= htmlspecialchars($ts['author']) ?></div>
+          </div>
+        </div>
+      <?php endforeach; ?>
+    </div>
+    <p class="text-muted small mt-3 mb-0">[Placeholder testimonials — replace with real, consented patient feedback.]</p>
   </div>
 </section>
 

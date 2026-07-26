@@ -1,0 +1,7 @@
+# Prevent directory listing and script execution inside this uploads folder.
+# Screenshots here should only ever be served through view_payment_proof.php,
+# which checks that the requester is a logged-in staff/doctor.
+Options -Indexes
+<FilesMatch "\.(php|phtml|php\d)$">
+    Require all denied
+</FilesMatch>

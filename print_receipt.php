@@ -10,6 +10,8 @@
  * reprinted later or by reloading the page after leaving.
  */
 session_start();
+require_once __DIR__ . '/session_helpers.php';
+enforceStaffSessionTimeout(120);
 require_once __DIR__ . '/translations.php';
 
 if (!isset($_SESSION['lang'])) {
