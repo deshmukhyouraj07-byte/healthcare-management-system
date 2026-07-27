@@ -246,7 +246,7 @@ try {
         <div class="gallery-img"><img src="sassooon.jpg" alt="Hospital corridor"></div>
       </div>
       <div class="col-md-4">
-        <div class="gallery-img"><img src="uro.jpg" alt="Department illustration"></div>
+        <div class="gallery-img"><img src="collegegate.jpg" alt="Department illustration"></div>
       </div>
     </div>
     <p class="text-muted small mt-3 mb-0">[Placeholder gallery — swap these images out for your own hospital photos.]</p>

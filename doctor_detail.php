@@ -113,8 +113,8 @@ foreach ($specialties as $sp) {
     <div class="d-flex align-items-end gap-4 flex-wrap mb-3">
       <?php if ($photoUrl): ?>
         <img src="<?= htmlspecialchars($photoUrl) ?>" alt="Dr. <?= htmlspecialchars($doctor['full_name']) ?>" class="doctor-photo">
-      <?php else: ?>
-        <div class="doctor-photo-fallback"><i class="bi bi-person-badge"></i></div>
+      <?php else: ?><img src="pediatric.jpg" alt="Girl in a jacket" style="width: 100px; height: 90px; border-radius: 50%; object-fit: cover;">
+</div>
       <?php endif; ?>
       <div>
         <h2 class="fw-bold mb-1">Dr. <?= htmlspecialchars($doctor['full_name']) ?></h2>
@@ -124,7 +124,7 @@ foreach ($specialties as $sp) {
           </a>
         </div>
         <?php if ($doctor['qualifications']): ?>
-          <div class="text-muted small mt-1"><i class="bi bi-mortarboard me-1"></i><?= htmlspecialchars($doctor['qualifications']) ?></div>
+          <div class="text-muted small mt-1">"><img src="pediatric.jpg" alt="Girl in a jacket" width="500" height="600"></i><?= htmlspecialchars($doctor['qualifications']) ?></div>
         <?php endif; ?>
       </div>
     </div>
